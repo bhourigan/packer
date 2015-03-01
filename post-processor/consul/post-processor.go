@@ -3,9 +3,11 @@ package consul
 import (
 	"fmt"
 	"strings"
+	"encoding/json"
 
+	"github.com/mitchellh/goamz/aws"
+	"github.com/mitchellh/goamz/ec2"
         "github.com/hashicorp/consul/api"
-	"github.com/mitchellh/mapstructure"
 	"github.com/mitchellh/packer/common"
 	"github.com/mitchellh/packer/packer"
 )
@@ -15,28 +17,18 @@ var builtins = map[string]string{
 	"mitchellh.amazon.instance": "amazoninstance",
 }
 
-// Artifacts can return a string for this state key and the post-processor
-// will use automatically use this as the type. The user's value overrides
-// this if `artifact_type_override` is set to true.
-const ArtifactStateType = "consul.artifact.type"
-
-// Artifacts can return a map[string]string for this state key and this
-// post-processor will automatically merge it into the metadata for any
-// uploaded artifact versions.
-const ArtifactStateMetadata = "consul.artifact.metadata"
-
 type Config struct {
 	common.PackerConfig `mapstructure:",squash"`
 
-	Artifact     string
-	Type         string `mapstructure:"artifact_type"`
-	TypeOverride bool   `mapstructure:"artifact_type_override"`
-	Metadata     map[string]string
+	AwsAccessKey     string `mapstructure:"aws_access_key"`
+	AwsSecretKey     string `mapstructure:"aws_secret_key"`
+	AwsToken         string `mapstructure:"aws_token"`
+	ConsulAddress    string `mapstructure:"consul_address"`
+	ConsulScheme     string `mapstructure:"consul_scheme"`
+	ConsulToken      string `mapstructure:"consul_token"`
 
-	Address      string `mapstructure:"address"`
-	Scheme       string `mapstructure:"scheme"`
-	Datacenter   string `mapstructure:"datacenter"`
-	Token        string `mapstructure:"token"`
+	ProjectName      string `mapstructure:"project_name"`
+	ProjectVersion   string `mapstructure:"project_version"`
 
 	tpl *packer.ConfigTemplate
 }
@@ -44,6 +36,7 @@ type Config struct {
 type PostProcessor struct {
 	config Config
 	client *api.Client
+	auth aws.Auth
 }
 
 func (p *PostProcessor) Configure(raws ...interface{}) error {
@@ -59,10 +52,14 @@ func (p *PostProcessor) Configure(raws ...interface{}) error {
 	p.config.tpl.UserVars = p.config.PackerUserVars
 
 	templates := map[string]*string{
-		"address":    &p.config.Address,
-		"scheme":     &p.config.Scheme,
-		"datacenter": &p.config.Datacenter,
-		"token":      &p.config.Token,
+		"consul_address":    &p.config.ConsulAddress,
+		"consul_scheme":     &p.config.ConsulScheme,
+		"consul_token":      &p.config.ConsulToken,
+		"aws_access_key":    &p.config.AwsAccessKey,
+		"aws_secret_key":    &p.config.AwsSecretKey,
+		"aws_token":         &p.config.AwsToken,
+		"project_name":      &p.config.ProjectName,
+                "project_version":   &p.config.ProjectVersion,
 	}
 
 	errs := new(packer.MultiError)
@@ -75,7 +72,11 @@ func (p *PostProcessor) Configure(raws ...interface{}) error {
 	}
 
 	required := map[string]*string{
-		"address":      &p.config.Address,
+		"consul_address":      &p.config.ConsulAddress,
+		"aws_access_key":      &p.config.AwsAccessKey,
+		"aws_secret_key":      &p.config.AwsSecretKey,
+		"project_name":        &p.config.ProjectName,
+                "project_version":     &p.config.ProjectVersion,
 	}
 
 	for key, ptr := range required {
@@ -89,27 +90,14 @@ func (p *PostProcessor) Configure(raws ...interface{}) error {
 		return errs
 	}
 
-	config := api.DefaultConfig()
-	if p.config.Address != "" {
-		config.Address = p.config.Address
+	p.auth, err = aws.GetAuth(p.config.AwsAccessKey, p.config.AwsSecretKey)
+	if err != nil {
+		return err
 	}
 
-	if p.config.Scheme != "" {
-		config.Scheme = p.config.Scheme
+	if p.config.AwsToken != "" {
+		p.config.AwsToken = p.auth.Token
 	}
-
-	if p.config.Datacenter != "" {
-		config.Datacenter = p.config.Datacenter
-	}
-
-	if p.config.Token != "" {
-		config.Token = p.config.Token
-	}
-
-        p.client, err = api.NewClient(config)
-        if err != nil {
-                return err
-        }
 
 	return nil
 }
@@ -121,9 +109,8 @@ func (p *PostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact) (pac
 			"Unsupported artifact type: %s", artifact.BuilderId())
 	}
 
-/*	kv := p.client.KV()
-	artifacts := p.metadata(artifact)
-*/
+	ui.Say("Putting build artifacts into consul")
+
 	for _, regions := range strings.Split(artifact.Id(), ",") {
 		parts := strings.Split(regions, ":")
 		if len(parts) != 2 {
@@ -131,54 +118,51 @@ func (p *PostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact) (pac
 			return nil, false, err
 		}
 
-		ui.Message(fmt.Sprintf("AMI ID part 0: %s", parts[0]))
-		ui.Message(fmt.Sprintf("AMI ID part 1: %s", parts[1]))
-	}
+		regionconn := ec2.New(p.auth, aws.Regions[parts[0]])
+		ids := []string{parts[1]}
+		if images, err := regionconn.Images(ids, nil); err == nil {
+			config := api.DefaultConfig()
+			config.Address = p.config.ConsulAddress
+			config.Datacenter = parts[0]
 
-        Id := artifact.Id()
-        ui.Message(fmt.Sprintf("AMI IDs: %s", Id))
+			if p.config.ConsulScheme != "" {
+				config.Scheme = p.config.ConsulScheme
+			}
 
-/*
-	data := &api.KVPair{Key: artifact.Id(), Value: p.metadata(artifact)}
+			if p.config.ConsulToken != "" {
+				config.Token = p.config.ConsulToken
+			}
 
-	_, err := kv.Put(data, nil)
-	if err != nil {
-    		return nil, false, err
-	}
-*/
-	return artifact, false, nil
-}
+		        client, err := api.NewClient(config)
+		        if err == nil {
+				kv := client.KV()
+				consul_key_prefix := fmt.Sprintf("aws/%s/%s/%s", images.Images[0].RootDeviceType, p.config.ProjectName, p.config.ProjectVersion)
 
-func (p *PostProcessor) metadata(artifact packer.Artifact) map[string]string {
-	var metadata map[string]string
-	metadataRaw := artifact.State(ArtifactStateMetadata)
-	if metadataRaw != nil {
-		if err := mapstructure.Decode(metadataRaw, &metadata); err != nil {
-			panic(err)
+				ui.Message(fmt.Sprintf("Putting %s image data into consul key prefix %s in datacenter %s",
+					parts[1], consul_key_prefix, config.Datacenter))
+
+				consul_data_key := fmt.Sprintf("%s/data", consul_key_prefix)
+				ami_data, _ := json.Marshal(images.Images)
+				kv_ami_data := &api.KVPair{Key: consul_data_key, Value: ami_data}
+				_, err := kv.Put(kv_ami_data, nil)
+				if err != nil {
+					return artifact, false, err
+				}
+
+				consul_ami_key := fmt.Sprintf("%s/ami", consul_key_prefix)
+				kv_ami_id := &api.KVPair{Key: consul_ami_key, Value: []byte(parts[1])}
+				_, err = kv.Put(kv_ami_id, nil)
+
+				if err != nil {
+					return artifact, false, err
+				}
+			} else {
+				return artifact, false, err
+		        }
+		} else {
+			return artifact, false, err
 		}
 	}
 
-	if p.config.Metadata != nil {
-		// If we have no extra metadata, just return as-is
-		if metadata == nil {
-			return p.config.Metadata
-		}
-
-		// Merge the metadata
-		for k, v := range p.config.Metadata {
-			metadata[k] = v
-		}
-	}
-
-	return metadata
-}
-
-func (p *PostProcessor) artifactType(artifact packer.Artifact) string {
-	if !p.config.TypeOverride {
-		if v := artifact.State(ArtifactStateType); v != nil {
-			return v.(string)
-		}
-	}
-
-	return p.config.Type
+	return artifact, true, nil
 }
